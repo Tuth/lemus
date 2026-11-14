@@ -58,7 +58,22 @@ else()
   # The solver's per-sample copies are a few doubles: kept inline rather than made memcpy calls.
   set_source_files_properties(${TR909_DIR}/core/circuit.cpp PROPERTIES COMPILE_OPTIONS "-fno-builtin-memcpy;-fno-builtin-memmove")
 endif()
-set_target_properties(lemus_tr909core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# The solver's column passes run four doubles at a time where the CPU has AVX (core/circuit.cpp's
+# Quad kernels): the same mul-add as the two-wide SSE2 pass and no FMA, so an AVX build's audio is
+# bit for bit a plain one's (checked with tr909replay, partition by partition, and on the
+# tr909voicerun workloads). -ffp-contract=off beside -mavx2 keeps the compiler from fusing what
+# the plain build leaves separate (MSVC never contracts under its default /fp:precise). Off by
+# default, so the plugins still run on any x86-64; with it on they need AVX2 (Intel 2013, AMD
+# 2015), and a busy kit renders about 6-7 % faster for it.
+option(LEMUS_TR909_AVX2 "TR-909: build the circuit solver with AVX2 (the plugins then need an AVX2 CPU at run time)" OFF)
+if(LEMUS_TR909_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i686)$")
+  if(MSVC)
+    target_compile_options(lemus_tr909core PRIVATE /arch:AVX2)
+  else()
+    target_compile_options(lemus_tr909core PRIVATE -mavx2 -ffp-contract=off)
+  endif()
+endif()
+set_target_properties(lemus_tr909core PROPERTIES POSITION_IN_PIE ON)
 
 # Tools. The firmware test driver: script the panel and MIDI, log triggers, DACs, LEDs.
 add_executable(tr909seq ${TR909_DIR}/tools/tr909seq/tr909seq.cpp)

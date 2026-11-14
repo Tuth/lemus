@@ -4,6 +4,9 @@
 #include <arm_neon.h>
 #else
 #include <emmintrin.h>
+#if defined(__AVX__)
+#include <immintrin.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -200,6 +203,19 @@ using Pair = __m128d;
 [[gnu::always_inline]] inline double msub(double s, double a, double x) { return s - a * x; }
 #endif
 
+// Four doubles a pass where the machine has AVX: the same mul-add as the two-wide pass (no FMA,
+// so each term rounds exactly as the SSE2 build's; -ffp-contract=off keeps the compiler from
+// fusing where the plain loops would not). ARM64 has no four-wide double vector unit: its pairs
+// already fuse (vfmaq), and its rounding differs from this build's as it stands.
+#if defined(__AVX__)
+using Quad = __m256d;
+[[gnu::always_inline]] inline Quad quadLoad(const double *p) { return _mm256_loadu_pd(p); }
+[[gnu::always_inline]] inline void quadStore(double *p, Quad v) { _mm256_storeu_pd(p, v); }
+[[gnu::always_inline]] inline Quad quadDup(double x) { return _mm256_set1_pd(x); }
+[[gnu::always_inline]] inline Quad quadMadd(Quad s, Quad a, Quad x) { return _mm256_add_pd(s, _mm256_mul_pd(a, x)); }
+[[gnu::always_inline]] inline Quad quadMsub(Quad s, Quad a, Quad x) { return _mm256_sub_pd(s, _mm256_mul_pd(a, x)); }
+#endif
+
 // The largest |x[k]| (x finite), two at a time.
 [[gnu::always_inline]] inline double maxAbs(const double *x, int n)
 {
@@ -210,6 +226,18 @@ using Pair = __m128d;
 		m = vmaxq_f64(m, vabsq_f64(vld1q_f64(x + k)));
 	double big = vmaxvq_f64(m);
 	if (k < n)
+		big = std::max(big, std::abs(x[k]));
+	return big;
+#elif defined(__AVX__)
+	const __m256d absMask = _mm256_castsi256_pd(_mm256_set1_epi64x(int64_t(0x7fffffffffffffffLL)));
+	__m256d m = _mm256_setzero_pd();
+	int k = 0;
+	for (; k + 4 <= n; k += 4)
+		m = _mm256_max_pd(m, _mm256_and_pd(absMask, _mm256_loadu_pd(x + k)));
+	alignas(32) double t[4];
+	_mm256_store_pd(t, m);
+	double big = std::max(std::max(t[0], t[1]), std::max(t[2], t[3]));
+	for (; k < n; ++k) // up to three behind the quads
 		big = std::max(big, std::abs(x[k]));
 	return big;
 #else
@@ -247,6 +275,14 @@ bool luDecompose(double *a, int n, int *piv)
 	case 14: return luDecomposeN<14>(a, piv);
 	case 15: return luDecomposeN<15>(a, piv);
 	case 16: return luDecomposeN<16>(a, piv);
+	case 17: return luDecomposeN<17>(a, piv);
+	case 18: return luDecomposeN<18>(a, piv);
+	case 19: return luDecomposeN<19>(a, piv);
+	case 20: return luDecomposeN<20>(a, piv);
+	case 21: return luDecomposeN<21>(a, piv);
+	case 22: return luDecomposeN<22>(a, piv);
+	case 23: return luDecomposeN<23>(a, piv);
+	case 24: return luDecomposeN<24>(a, piv);
 	default: return luDecomposeAny(a, n, piv);
 	}
 }
@@ -270,6 +306,14 @@ void luSolve(const double *lu, int n, const int *piv, double *b)
 	case 14: return luSolveN<14>(lu, piv, b);
 	case 15: return luSolveN<15>(lu, piv, b);
 	case 16: return luSolveN<16>(lu, piv, b);
+	case 17: return luSolveN<17>(lu, piv, b);
+	case 18: return luSolveN<18>(lu, piv, b);
+	case 19: return luSolveN<19>(lu, piv, b);
+	case 20: return luSolveN<20>(lu, piv, b);
+	case 21: return luSolveN<21>(lu, piv, b);
+	case 22: return luSolveN<22>(lu, piv, b);
+	case 23: return luSolveN<23>(lu, piv, b);
+	case 24: return luSolveN<24>(lu, piv, b);
 	default: return luSolveAny(lu, n, piv, b);
 	}
 }
@@ -299,11 +343,19 @@ template <int N> bool luDecomposeN(double *a, int *piv)
 			ar[k] = f;
 			if (f == 0)
 				continue;
-			// a[r][c] -= f a[k][c], two columns at a time (each a fused multiply-subtract, as the
-			// plain loop's contraction)
+			// a[r][c] -= f a[k][c], two columns at a time (four where the machine has AVX; each a
+			// fused multiply-subtract as the plain loop's contraction, never more)
 			const Pair fp = pairDup(f);
+#if defined(__AVX__)
+			const Quad fq = quadDup(f);
+			int c = k + 1;
+			for (; c + 4 <= n; c += 4)
+				quadStore(ar + c, quadMsub(quadLoad(ar + c), quadLoad(pk + c), fq));
+			for (; c + 2 <= n; c += 2)
+#else
 			int c = k + 1;
 			for (; c + 2 <= n; c += 2)
+#endif
 				pairStore(ar + c, pairMsub(pairLoad(ar + c), pairLoad(pk + c), fp));
 			if (c < n)
 				ar[c] = msub(ar[c], pk[c], f);
@@ -463,6 +515,33 @@ template <int NA, bool acc, bool sub>
 		pairStore(out + 2 * j, s[j]);
 }
 
+#if defined(__AVX__)
+// The same four rows at a time: the four chains run side by side as the pairs' two, each row's sum
+// in the same order with the same mul-add (no FMA), so the result is the same a pair at a time gives.
+template <int NQ, bool acc, bool sub>
+[[gnu::always_inline]] inline void colBlockQ(const double *__restrict a, int ld, const double *__restrict c, const double *__restrict x,
+					     double *__restrict out, int cols, const double *__restrict x2, int cols2)
+{
+	Quad s[NQ];
+	for (int j = 0; j < NQ; ++j)
+		s[j] = quadLoad((acc ? out : c) + 4 * j);
+	for (int k = 0; k < cols; ++k) {
+		const Quad xk = quadDup(x[k]);
+		const double *ak = a + size_t(k) * size_t(ld);
+		for (int j = 0; j < NQ; ++j)
+			s[j] = sub ? quadMsub(s[j], quadLoad(ak + 4 * j), xk) : quadMadd(s[j], quadLoad(ak + 4 * j), xk);
+	}
+	for (int k = 0; k < cols2; ++k) {
+		const Quad xk = quadDup(x2[k]);
+		const double *ak = a + size_t(cols + k) * size_t(ld);
+		for (int j = 0; j < NQ; ++j)
+			s[j] = sub ? quadMsub(s[j], quadLoad(ak + 4 * j), xk) : quadMadd(s[j], quadLoad(ak + 4 * j), xk);
+	}
+	for (int j = 0; j < NQ; ++j)
+		quadStore(out + 4 * j, s[j]);
+}
+#endif
+
 // (sub: out[r] = c[r] - A[r][:cols] x, each term subtracted in turn.) colMatVec2: x in two parts,
 // the first `cols` columns' x then the next `cols2` columns' x2 (a step's states and inputs, where
 // they are kept).
@@ -473,6 +552,16 @@ void colMatVec2(const ColMat &A, int r0, int rows, int cols, const double *__res
 	const int ld = A.ld;
 	const double *a = A.d.data() + r0;
 	int r = 0;
+#if defined(__AVX__)
+	for (; r + 16 <= rows; r += 16)
+		colBlockQ<4, acc, sub>(a + r, ld, c + r, x, out + r, cols, x2, cols2);
+	for (; r + 4 <= rows; r += 4)
+		colBlockQ<1, acc, sub>(a + r, ld, c + r, x, out + r, cols, x2, cols2);
+	if (r + 2 <= rows) {
+		colBlock<1, acc, sub>(a + r, ld, c + r, x, out + r, cols, x2, cols2);
+		r += 2;
+	}
+#else
 	for (; r + 16 <= rows; r += 16)
 		colBlock<8, acc, sub>(a + r, ld, c + r, x, out + r, cols, x2, cols2);
 	switch ((rows - r) / 2) {
@@ -486,6 +575,7 @@ void colMatVec2(const ColMat &A, int r0, int rows, int cols, const double *__res
 	default: break;
 	}
 	r += (rows - r) & ~1;
+#endif
 	if (r < rows) { // an odd last row
 		double s = acc ? out[r] : c[r];
 		for (int k = 0; k < cols; ++k)
@@ -516,6 +606,22 @@ inline void colMatVec(const ColMat &A, int r0, int rows, int cols, const double 
 	}
 	bool any = (vgetq_lane_u64(bad, 0) | vgetq_lane_u64(bad, 1)) != 0;
 	if (k < n)
+		any = any || x[k] < lo[k] || x[k] > hi[k] || !(std::abs(x[k]) < big);
+	return any;
+#elif defined(__AVX__)
+	const __m256d b = _mm256_set1_pd(big);
+	const __m256d absMask = _mm256_castsi256_pd(_mm256_set1_epi64x(int64_t(0x7fffffffffffffffLL)));
+	__m256d bad = _mm256_setzero_pd();
+	int k = 0;
+	for (; k + 4 <= n; k += 4) {
+		const __m256d v = _mm256_loadu_pd(x + k);
+		bad = _mm256_or_pd(bad, _mm256_or_pd(_mm256_cmp_pd(v, _mm256_loadu_pd(lo + k), _CMP_LT_OQ),
+						     _mm256_cmp_pd(v, _mm256_loadu_pd(hi + k), _CMP_GT_OQ)));
+		// not under `big`, NaN included (an unordered not-less-than)
+		bad = _mm256_or_pd(bad, _mm256_cmp_pd(_mm256_and_pd(absMask, v), b, _CMP_NLT_UQ));
+	}
+	bool any = _mm256_movemask_pd(_mm256_cmp_pd(bad, _mm256_setzero_pd(), _CMP_NEQ_UQ)) != 0;
+	for (; k < n; ++k) // up to three behind the quads
 		any = any || x[k] < lo[k] || x[k] > hi[k] || !(std::abs(x[k]) < big);
 	return any;
 #else
@@ -1599,11 +1705,11 @@ void Circuit::load(const Netlist &netlist)
 		const size_t nx = size_t(m_nx), np = size_t(m_np), w1 = nx + size_t(m_nu - m_constCount), nr = nx + size_t(m_ny);
 		lin.evI.assign(np, 0.0);
 		lin.evJac.assign(np * np, 0.0);
-		lin.Zc.assign(6 * std::max(np, nr), 0.0);
+		lin.Zc.assign(3 * (std::max(np, nr) + kColPad), 0.0);
 		lin.T.assign(3 * (w1 + np), 0.0);
 		lin.GZ.assign(3 * np, 0.0);
 		lin.gzc.assign(np + 1, 0.0);
-		lin.CZc.assign(3 * (nr + 1), 0.0);
+		lin.CZc.assign(3 * (nr + kColPad), 0.0);
 		lin.zeros.assign(nr + 1, 0.0);
 		lin.loSave.assign(3, 0.0);
 		lin.hiSave.assign(3, 0.0);
@@ -2241,12 +2347,28 @@ template <int NP> bool Circuit::factor(Level &L)
 				if (g == 0)
 					continue;
 				const double *__restrict f = FT + size_t(q) * size_t(np);
+#if defined(__AVX__)
+				// four entries a pass, each term the same mul (and exact negation) as scalar
+				const Quad gq = quadDup(g);
+				const __m256d neg = _mm256_castsi256_pd(_mm256_set1_epi64x(int64_t(0x8000000000000000LL)));
+				int a = 0;
+				if (first) {
+					for (; a + 4 <= np; a += 4)
+						quadStore(mc + a, _mm256_xor_pd(_mm256_mul_pd(quadLoad(f + a), gq), neg));
+				} else {
+					for (; a + 4 <= np; a += 4)
+						quadStore(mc + a, quadMsub(quadLoad(mc + a), quadLoad(f + a), gq));
+				}
+				for (; a < np; ++a)
+					mc[a] = first ? -f[a] * g : mc[a] - f[a] * g;
+#else
 				if (first)
 					for (int a = 0; a < np; ++a)
 						mc[a] = -f[a] * g;
 				else
 					for (int a = 0; a < np; ++a)
 						mc[a] -= f[a] * g;
+#endif
 				first = false;
 			}
 			big = maxAbs(mc, np);
@@ -3332,7 +3454,7 @@ bool Circuit::linearMatrices()
 				s -= lin.G[size_t(a * np + b)] * v0[b];
 			c[size_t(a)] = s;
 		}
-	lin.mRow = np + (np & 1);
+	lin.mRow = padRows(np);
 	lin.KM.assign(lin.mRow + nr, w1);
 	lin.kvm.assign(size_t(lin.KM.ld), 0.0);
 	lin.fused.assign(size_t(lin.KM.ld), 0.0);
@@ -3484,6 +3606,17 @@ template <int k> [[gnu::always_inline]] inline void relinT(const double *c, int 
 
 template <int k> [[gnu::always_inline]] inline void relinUpdate(double *__restrict c, int ld, const double *__restrict Zc, const double *t)
 {
+#if defined(__AVX__)
+	Quad tj[k];
+	for (int j = 0; j < k; ++j)
+		tj[j] = quadDup(t[j]);
+	for (int r = 0; r < ld; r += 4) {
+		Quad s = quadLoad(c + r);
+		for (int j = 0; j < k; ++j)
+			s = quadMadd(s, quadLoad(Zc + j * ld + r), tj[j]);
+		quadStore(c + r, s);
+	}
+#else
 	Pair tj[k];
 	for (int j = 0; j < k; ++j)
 		tj[j] = pairDup(t[j]);
@@ -3493,6 +3626,7 @@ template <int k> [[gnu::always_inline]] inline void relinUpdate(double *__restri
 			s = pairMadd(s, pairLoad(Zc + j * ld + r), tj[j]);
 		pairStore(c + r, s);
 	}
+#endif
 }
 
 template <int k, bool rows>
@@ -3513,6 +3647,28 @@ void relinColumns(ColMat &KM, int mRow, int ldm, const ColMat &Cs, ColMat &Zf, i
 		return;
 	for (int q = 0; q < w1; ++q) {
 		const double *kc = KM.col(q), *t = T + q * k;
+#if defined(__AVX__)
+		Quad tq[k], dq[k];
+		for (int a = 0; a < k; ++a) {
+			double s = 0;
+			for (int b = 0; b < k; ++b) {
+				const double g = dG[a * k + b];
+				if (g != 0)
+					s += g * kc[P + b];
+			}
+			dq[a] = quadDup(s);
+			tq[a] = quadDup(t[a]);
+		}
+		double *__restrict mc = KM.col(q) + mRow;
+		for (int r = 0; r < ldm; r += 4) {
+			Quad s = quadLoad(mc + r);
+			for (int j = 0; j < k; ++j) {
+				s = quadMadd(s, quadLoad(cz + j * ldm + r), tq[j]);
+				s = quadMadd(s, quadLoad(Cs.col(P + j) + r), dq[j]);
+			}
+			quadStore(mc + r, s);
+		}
+#else
 		Pair tj[k], dk[k];
 		for (int a = 0; a < k; ++a) {
 			double s = 0;
@@ -3533,6 +3689,7 @@ void relinColumns(ColMat &KM, int mRow, int ldm, const ColMat &Cs, ColMat &Zf, i
 			}
 			pairStore(mc + r, s);
 		}
+#endif
 	}
 }
 
@@ -3675,7 +3832,7 @@ template <int K> bool Circuit::relinearizeT(const Device &d, const double *v, co
 	// G Z with the old G (np x k), then Cs G Z (nr x k, by columns); none of the rows' terms while
 	// they're left stale (linearRows works them out from the currents)
 	double *GZ = lin.GZ.data(), *cz = lin.CZc.data();
-	const int ldm = nr + (nr & 1); // M's rows in KM, padded (and Cs's, cz's)
+	const int ldm = padRows(nr); // M's rows in KM, padded (and Cs's, cz's)
 	const bool rows = !lin.rowsStale;
 	if (rows) {
 		for (const auto &e : m_devices)
