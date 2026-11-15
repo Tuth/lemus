@@ -433,10 +433,20 @@ void luSolveAny(const double *lu, int n, const int *piv, double *b)
 
 // A copy of the few doubles a step moves about (5-30): inline (circuit.cpp is built without the
 // memcpy/memmove builtins, so the compiler doesn't make such loops library calls).
+// MSVC has no such switch and turns the loop into a memcpy call (measured: 2.4 % of a busy kit's
+// work in VCRUNTIME140's memcpy, called from here); a pair at a time it can't.
 [[gnu::always_inline]] inline void copyN(const double *__restrict from, int n, double *__restrict to)
 {
+#if defined(_MSC_VER) && !defined(__clang__)
+	int k = 0;
+	for (; k + 2 <= n; k += 2)
+		pairStore(to + k, pairLoad(from + k));
+	if (k < n)
+		to[k] = from[k];
+#else
 	for (int k = 0; k < n; ++k)
 		to[k] = from[k];
+#endif
 }
 
 // SPICE's pnjlim: keeps Newton from overshooting up an exponential.
