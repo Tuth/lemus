@@ -130,8 +130,18 @@ double parseValue(const std::string &text); // "4.7k" -> 4700; throws on junk
 // A pot's resistance from its wiper to `b` as a share of the whole, at rotation `position` (0-1).
 double potShare(double position, double taperMid);
 
-// A matrix stored by columns, each padded to an even length: the step's products run down the
-// columns two rows at a time (Circuit's colMatVec), each row's sum in the order of a plain loop.
+// A matrix stored by columns, each padded to a multiple of kColPad: the step's products run down
+// the columns two rows at a time (Circuit's colMatVec), four where the machine has AVX, each row's
+// sum in the order of a plain loop.
+#if defined(__AVX__)
+constexpr int kColPad = 4;
+#else
+constexpr int kColPad = 2;
+#endif
+inline int padRows(int r)
+{
+	return (r + kColPad - 1) / kColPad * kColPad;
+}
 struct ColMat {
 	int rows = 0, cols = 0, ld = 0;
 	std::vector<double> d;
@@ -139,7 +149,7 @@ struct ColMat {
 	{
 		rows = r;
 		cols = c;
-		ld = r + (r & 1);
+		ld = padRows(r);
 		d.assign(size_t(ld) * size_t(c), 0.0);
 	}
 	double &operator()(int r, int c) { return d[size_t(c) * size_t(ld) + size_t(r)]; }

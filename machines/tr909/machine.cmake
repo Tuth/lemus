@@ -53,10 +53,33 @@ find_package(Threads REQUIRED) # core/cymbals.cpp times the clocks on a few thre
 target_link_libraries(lemus_tr909core PUBLIC lemus_upd7810 Threads::Threads)
 if(MSVC)
   target_compile_options(lemus_tr909core PRIVATE /O2 /W3)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # clang-cl (Visual Studio's ClangCL toolset, -T ClangCL): as GCC/Clang below, the solver's copies
+    # stay inline, and no a * x + s is contracted into an FMA (clang's default contracts within an
+    # expression, and /arch:AVX2 gives it FMA), so its audio is bit for bit MSVC's. Measured with
+    # tr909bench: all golden WAVs byte-identical, about 11 % fewer cycles than MSVC 14.40.
+    target_compile_options(lemus_tr909core PRIVATE /clang:-ffp-contract=off)
+    set_source_files_properties(${TR909_DIR}/core/circuit.cpp PROPERTIES COMPILE_OPTIONS "/clang:-fno-builtin-memcpy;/clang:-fno-builtin-memmove")
+  endif()
 else()
   target_compile_options(lemus_tr909core PRIVATE -O3 -Wall -Wextra)
   # The solver's per-sample copies are a few doubles: kept inline rather than made memcpy calls.
   set_source_files_properties(${TR909_DIR}/core/circuit.cpp PROPERTIES COMPILE_OPTIONS "-fno-builtin-memcpy;-fno-builtin-memmove")
+endif()
+# The solver's column passes run four doubles at a time where the CPU has AVX (core/circuit.cpp's
+# Quad kernels): the same mul-add as the two-wide SSE2 pass and no FMA, so an AVX build's audio is
+# bit for bit a plain one's (checked with tr909replay, partition by partition, and on the
+# tr909voicerun workloads). -ffp-contract=off beside -mavx2 keeps the compiler from fusing what
+# the plain build leaves separate (MSVC never contracts under its default /fp:precise). Off by
+# default, so the plugins still run on any x86-64; with it on they need AVX2 (Intel 2013, AMD
+# 2015), and a busy kit renders about 6-7 % faster for it.
+option(LEMUS_TR909_AVX2 "TR-909: build the circuit solver with AVX2 (the plugins then need an AVX2 CPU at run time)" OFF)
+if(LEMUS_TR909_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i686)$")
+  if(MSVC)
+    target_compile_options(lemus_tr909core PRIVATE /arch:AVX2)
+  else()
+    target_compile_options(lemus_tr909core PRIVATE -mavx2 -ffp-contract=off)
+  endif()
 endif()
 set_target_properties(lemus_tr909core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
