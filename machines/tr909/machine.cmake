@@ -73,7 +73,7 @@ if(LEMUS_TR909_AVX2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i686)$")
     target_compile_options(lemus_tr909core PRIVATE -mavx2 -ffp-contract=off)
   endif()
 endif()
-set_target_properties(lemus_tr909core PROPERTIES POSITION_IN_PIE ON)
+set_target_properties(lemus_tr909core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Tools. The firmware test driver: script the panel and MIDI, log triggers, DACs, LEDs.
 add_executable(tr909seq ${TR909_DIR}/tools/tr909seq/tr909seq.cpp)
