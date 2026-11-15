@@ -2393,11 +2393,26 @@ template <int NP> bool Circuit::factor(Level &L)
 		L.pos[size_t(L.active[size_t(k)])] = k;
 	// M_AA, factored
 	double *M = L.luM.data();
-	for (int r = 0; r < nA; ++r) {
-		const int a = L.active[size_t(r)];
-		for (int c = 0; c < nA; ++c) {
-			const int b = L.active[size_t(c)];
-			M[r * nA + c] = col[size_t(b) * size_t(np) + size_t(a)] + (a == b ? 1.0 : 0.0);
+	if constexpr (NP > 0) {
+		// the active columns' starts held locally (the stores to M can't alias them), and the
+		// diagonal's + 1 written over the row's + 0 (the same sums: the active ports are distinct)
+		const double *base[NP];
+		for (int c = 0; c < nA; ++c)
+			base[c] = col + size_t(L.active[size_t(c)]) * size_t(np);
+		for (int r = 0; r < nA; ++r) {
+			const size_t a = size_t(L.active[size_t(r)]);
+			double *__restrict Mr = M + r * nA;
+			for (int c = 0; c < nA; ++c)
+				Mr[c] = base[c][a] + 0.0;
+			Mr[r] = base[r][a] + 1.0;
+		}
+	} else {
+		for (int r = 0; r < nA; ++r) {
+			const int a = L.active[size_t(r)];
+			for (int c = 0; c < nA; ++c) {
+				const int b = L.active[size_t(c)];
+				M[r * nA + c] = col[size_t(b) * size_t(np) + size_t(a)] + (a == b ? 1.0 : 0.0);
+			}
 		}
 	}
 	if (!luDecompose(M, nA, L.luPiv.data()))
