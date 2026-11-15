@@ -21,6 +21,34 @@ using tr909::Machine;
 using tr909::Voice;
 
 namespace {
+
+#if JUCE_WINDOWS
+// A voice worker as Windows treats the host's own audio thread. Windows 11 throttles the threads of
+// a background process (EcoQoS: a lower clock) unless they opt out, whatever their priority, and the
+// host's audio thread waits for the workers at the end of each block: with the host in the background
+// a busy passage dropped out. The worker joins MMCSS "Pro Audio" and opts out of execution-speed
+// throttling. Both looked up at run time (avrt.dll; SetThreadInformation is Windows 8+), so an older
+// Windows just keeps the plain priority.
+void audioWorkerThread()
+{
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+	if (HMODULE avrt = LoadLibraryW(L"avrt.dll")) {
+		using AvSet = HANDLE(WINAPI *)(LPCWSTR, LPDWORD);
+		if (auto set = reinterpret_cast<AvSet>(reinterpret_cast<void *>(GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")))) {
+			DWORD index = 0;
+			set(L"Pro Audio", &index);
+		}
+	}
+	struct PowerThrottling { // THREAD_POWER_THROTTLING_STATE
+		ULONG version, controlMask, stateMask;
+	};
+	using SetInfo = BOOL(WINAPI *)(HANDLE, int, LPVOID, DWORD);
+	if (auto set = reinterpret_cast<SetInfo>(reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation")))) {
+		PowerThrottling st{1, 1, 0}; // version 1; control EXECUTION_SPEED; state 0: not throttled
+		set(GetCurrentThread(), 3 /* ThreadPowerThrottling */, &st, sizeof st);
+	}
+}
+#endif
 juce::String knobText(float v) { return juce::String(v * 10.0f, 1); }
 
 // The v4.0 firmware keeps its sync mode in bits 0-1 of VV:63 (0 INT, 1 MIDI, 2 DIN); SHIFT + TEMPO
@@ -179,7 +207,7 @@ TR909Processor::TR909Processor(const juce::MemoryBlock *firmware, const juce::Me
 #if JUCE_MAC
 			pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #elif JUCE_WINDOWS
-			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+			audioWorkerThread();
 #endif
 		},
 		[this](int index) {
